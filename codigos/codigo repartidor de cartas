@@ -1,0 +1,200 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <IRremote.hpp>
+#include <Servo.h>
+#include <EEPROM.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo baseServo;
+
+const int IR_PIN = 7;
+const int RELAY_PIN = 8;
+const int SERVO_PIN = 9;
+const int BUZZER_PIN = 6;
+
+const int SERVO_MIN = 20;
+const int SERVO_MAX = 160;
+
+int numJugadores, numCartas, cartasPorJugador;
+int cartasRepartidas = 0;
+int jugador = 1;
+
+enum Estado {
+  INICIO,
+  PEDIR_JUGADORES,
+  PEDIR_CARTAS,
+  PEDIR_POR_JUGADOR,
+  VALIDAR,
+  REPARTO,
+  FINALIZAR
+};
+
+Estado estado = INICIO;
+int valorActual = 0;
+int digitos = 0;
+bool pantallaMostrada = false;
+bool usarUltimos = false;
+
+void mostrarLCD(String l1, String l2 = "") {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(l1);
+  lcd.setCursor(0, 1);
+  lcd.print(l2);
+}
+
+int leerIR() {
+  if (IrReceiver.decode()) {
+    uint8_t code = IrReceiver.decodedIRData.command;
+    IrReceiver.resume();
+    switch (code) {
+      case 0x45: return 1;
+      case 0x46: return 2;
+      case 0x47: return 3;
+      case 0x44: return 4;
+      case 0x40: return 5;
+      case 0x43: return 6;
+      case 0x07: return 7;
+      case 0x15: return 8;
+      case 0x09: return 9;
+      case 0x19: return 0;
+      case 0x16: return -2;  // Borrar
+      case 0x1C: return -1;  // Enviar
+      case 0x0D: asm volatile("jmp 0"); return -4; // Reinicio
+      default: return -3;
+    }
+  }
+  return -3;
+}
+
+void entradaNumero(String titulo, int &destino, bool obligatorio = true) {
+  if (!pantallaMostrada) {
+    mostrarLCD(titulo, String(valorActual));
+    pantallaMostrada = true;
+  }
+  int ir = leerIR();
+  if (ir >= 0 && digitos < 3) {
+    valorActual = valorActual * 10 + ir;
+    digitos++;
+    pantallaMostrada = false;
+  } else if (ir == -2 && digitos > 0) {
+    valorActual /= 10;
+    digitos--;
+    pantallaMostrada = false;
+  } else if (ir == -1) {
+    if (obligatorio && valorActual == 0) return;
+    destino = valorActual;
+    valorActual = 0;
+    digitos = 0;
+    pantallaMostrada = false;
+    estado = (Estado)(estado + 1);
+  }
+}
+
+void girarBase(int jugador) {
+  if (numJugadores == 1) return;
+  float anguloBase = (float)(SERVO_MAX - SERVO_MIN) / (numJugadores - 1);
+  int angulo = SERVO_MIN + (jugador - 1) * anguloBase;
+  baseServo.attach(SERVO_PIN);
+  baseServo.write(angulo);
+  delay(500);
+  baseServo.detach();
+}
+
+void lanzarCarta() {
+  delay(100);
+  digitalWrite(RELAY_PIN, LOW);
+  delay(700);
+  digitalWrite(RELAY_PIN, HIGH);
+}
+
+bool validar() {
+  if (numJugadores < 2 || numJugadores > 10) return false;
+  if (cartasPorJugador == 0) cartasPorJugador = numCartas / numJugadores;
+  return numCartas >= cartasPorJugador * numJugadores;
+}
+
+void guardarEnEEPROM() {
+  EEPROM.update(0, numJugadores);
+  EEPROM.update(1, cartasPorJugador);
+  EEPROM.update(2, numCartas);
+}
+
+void cargarDesdeEEPROM() {
+  numJugadores = EEPROM.read(0);
+  cartasPorJugador = EEPROM.read(1);
+  numCartas = EEPROM.read(2);
+}
+
+void setup() {
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  lcd.init();
+  lcd.backlight();
+  mostrarLCD("Repartidor Cartas", "Iniciando...");
+  delay(1000);
+
+  IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
+  cargarDesdeEEPROM();
+  estado = PEDIR_JUGADORES;
+}
+
+void loop() {
+  switch (estado) {
+    case PEDIR_JUGADORES:
+      entradaNumero("# Jugadores:", numJugadores);
+      break;
+
+    case PEDIR_CARTAS:
+      entradaNumero("# Cartas Totales:", numCartas);
+      break;
+
+    case PEDIR_POR_JUGADOR:
+      entradaNumero("Cartas x Jugador:", cartasPorJugador, false);
+      break;
+
+    case VALIDAR:
+      if (!validar()) {
+        mostrarLCD("Reparto invalido", "Enviar para reinicio");
+        if (leerIR() == -1) estado = PEDIR_JUGADORES;
+      } else {
+        guardarEnEEPROM();
+        cartasRepartidas = 0;
+        jugador = 1;
+        estado = REPARTO;
+      }
+      break;
+
+    case REPARTO:
+      if (cartasRepartidas < cartasPorJugador * numJugadores) {
+        mostrarLCD("Jugador: " + String(jugador), "Carta: " + String(cartasRepartidas + 1));
+        girarBase(jugador);
+        lanzarCarta();
+        cartasRepartidas++;
+        jugador++;
+        if (jugador > numJugadores) jugador = 1;
+        delay(1000);
+      } else {
+        estado = FINALIZAR;
+        pantallaMostrada = false;
+      }
+      break;
+
+    case FINALIZAR:
+      if (!pantallaMostrada) {
+        mostrarLCD("Reparto Terminado", "Enviar = repetir");
+        pantallaMostrada = true;
+      }
+      if (leerIR() == -1) {
+        usarUltimos = true;
+        cargarDesdeEEPROM();
+        cartasRepartidas = 0;
+        jugador = 1;
+        estado = REPARTO;
+        pantallaMostrada = false;
+      }
+      break;
+  }
+}
